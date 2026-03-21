@@ -140,7 +140,30 @@ class ArchivistWindow(Adw.ApplicationWindow):
         self.resize_tid = None
         w = int(self.scrolled_window.get_hadjustment().get_page_size())
         if w > 0 and w != self.last_width:
+            anchor = self.page_anchor()
             self.update_layout(w)
+            GLib.idle_add(self.restore_anchor, anchor)
+        return GLib.SOURCE_REMOVE
+
+    def page_anchor(self):
+        """Return (page_idx, frac_within_page) for the page at the viewport top."""
+        if not self.page_y:
+            return (0, 0.0)
+        top = self.scrolled_window.get_vadjustment().get_value()
+        for i, py in enumerate(self.page_y):
+            _, ph = self.document.get_page(i).get_size()
+            sh = ph * self.scale
+            if py + sh > top:
+                return (i, (top - py) / sh if sh > 0 else 0.0)
+        return (len(self.page_y) - 1, 0.0)
+
+    def restore_anchor(self, anchor):
+        page_idx, frac = anchor
+        page_idx = min(page_idx, len(self.page_y) - 1)
+        _, ph = self.document.get_page(page_idx).get_size()
+        target = self.page_y[page_idx] + frac * ph * self.scale
+        vadj = self.scrolled_window.get_vadjustment()
+        vadj.set_value(max(0.0, min(target, vadj.get_upper() - vadj.get_page_size())))
         return GLib.SOURCE_REMOVE
 
     def update_layout(self, viewport_width):
