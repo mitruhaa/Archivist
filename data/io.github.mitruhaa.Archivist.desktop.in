@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Archivist
+Exec=archivist
+Icon=io.github.mitruhaa.Archivist
+Terminal=false
+Categories=Utility;
+StartupNotify=true

@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist gettext-domain="archivist">
+	<schema id="io.github.mitruhaa.Archivist" path="/io/github/mitruhaa/Archivist/">
+	</schema>
+</schemalist>
+

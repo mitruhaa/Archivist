@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<interface>
+
+  <!-- Required libraries -->
+  <requires lib="gtk" version="4.0"/>
+  <requires lib="Adw" version="1.0"/>
+
+  <!-- Main application window -->
+  <template class="ArchivistWindow" parent="AdwApplicationWindow">
+    <property name="title">Archivist</property>
+    <child>
+      <object class="AdwToolbarView">
+        <child type="top">
+          <object class="AdwHeaderBar"/>
+        </child>
+      </object>
+    </child>
+  </template>
+
+</interface>
