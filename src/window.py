@@ -7,6 +7,7 @@ from gi.repository import Adw, Gdk, Gio, Gtk, Poppler, GLib
 PAGE_GAP     = 20
 PAGE_PAD     = 20
 ZOOM_STEP    = 0.10
+ZOOM_SCROLL  = 0.05
 ZOOM_MIN     = 0.10
 ZOOM_MAX     = 5.00
 CACHE_BEHIND = 3    # pages to keep rendered behind viewport
@@ -37,8 +38,8 @@ class ArchivistWindow(Adw.ApplicationWindow):
         self.resize_tid  = None
         self.render_tid  = None
         self.page_y      = []   # precomputed top-y of each page at current scale
-        self.cache       = {}   # {page_index: cairo.ImageSurface}
-        self.cache_scale = 1.0
+        self.cache       = {}   # {page_index: cairo.ImageSurface} rendered at base_scale
+        self.cache_scale = 1.0  # base_scale at which cache entries were rendered
 
         self.open_file_button.connect('clicked', self.open_dialog)
         self.open_welcome_button.connect('clicked', self.open_dialog)
@@ -123,7 +124,7 @@ class ArchivistWindow(Adw.ApplicationWindow):
 
     def on_scroll(self, ctrl, dx, dy):
         if ctrl.get_current_event_state() & Gdk.ModifierType.CONTROL_MASK:
-            self.apply_zoom(self.zoom * (1.0 - dy * 0.1))
+            self.apply_zoom(self.zoom * (1.0 - dy * ZOOM_SCROLL))
             return True
         return False
 
@@ -238,9 +239,9 @@ class ArchivistWindow(Adw.ApplicationWindow):
         if not self.document:
             return GLib.SOURCE_REMOVE
 
-        if abs(self.scale - self.cache_scale) > 0.001:
+        if abs(self.base_scale - self.cache_scale) > 0.001:
             self.cache.clear()
-            self.cache_scale = self.scale
+            self.cache_scale = self.base_scale
 
         needed = self.needed_pages()
         self.evict(set(needed))
@@ -250,6 +251,7 @@ class ArchivistWindow(Adw.ApplicationWindow):
             return GLib.SOURCE_REMOVE
 
         self.render_page(to_render[0])
+        print(f"cache: {len(self.cache)}/{len(needed)} pages")
         self.drawing_area.queue_draw()
 
         if len(to_render) > 1:
@@ -260,13 +262,13 @@ class ArchivistWindow(Adw.ApplicationWindow):
     def render_page(self, i):
         page   = self.document.get_page(i)
         pw, ph = page.get_size()
-        sw, sh = max(1, int(pw * self.scale)), max(1, int(ph * self.scale))
+        sw, sh = max(1, int(pw * self.base_scale)), max(1, int(ph * self.base_scale))
         surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, sw, sh)
         ctx     = cairo.Context(surface)
-        ctx.scale(self.scale, self.scale)
+        ctx.scale(self.base_scale, self.base_scale)
         page.render(ctx)
         self.cache[i] = surface
-        self.cache_scale = self.scale
+        self.cache_scale = self.base_scale
 
     def evict(self, keep):
         for k in list(self.cache):
@@ -283,7 +285,6 @@ class ArchivistWindow(Adw.ApplicationWindow):
         cr.paint()
 
         clip = cr.clip_extents()
-        valid_cache = abs(self.cache_scale - self.scale) < 0.001
 
         y = PAGE_GAP
         for i in range(self.document.get_n_pages()):
@@ -298,10 +299,14 @@ class ArchivistWindow(Adw.ApplicationWindow):
             if y > clip[3]:
                 break
 
-            surface = self.cache.get(i) if valid_cache else None
+            surface = self.cache.get(i)
             if surface is not None:
-                cr.set_source_surface(surface, x, y)
+                cr.save()
+                cr.translate(x, y)
+                cr.scale(self.zoom, self.zoom)
+                cr.set_source_surface(surface, 0, 0)
                 cr.paint()
+                cr.restore()
             else:
                 cr.set_source_rgb(1, 1, 1)
                 cr.rectangle(x, y, sw, sh)
