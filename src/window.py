@@ -1,6 +1,7 @@
 import gi
 gi.require_version("Poppler", "0.18")
 import cairo
+from dataclasses import dataclass
 
 from gi.repository import Adw, Gdk, Gio, Gtk, Poppler, GLib
 
@@ -14,6 +15,13 @@ CACHE_AHEAD  = 2    # pages to pre-render ahead of viewport
 
 # Discrete zoom levels used by the +/- buttons, mirroring Evince's preset list
 ZOOM_LEVELS  = [0.25, 0.33, 0.50, 0.67, 0.75, 1.00, 1.25, 1.50, 2.00, 4.00]
+
+@dataclass
+class PageLayout:
+    x: float
+    y: float
+    width: float
+    height: float
 
 @Gtk.Template(resource_path='/io/github/mitruhaa/Archivist/gtk/window.ui')
 class ArchivistWindow(Adw.ApplicationWindow):
@@ -40,7 +48,7 @@ class ArchivistWindow(Adw.ApplicationWindow):
         self.last_width      = -1
         self.resize_tid      = None
         self.render_tid      = None
-        self.page_y          = []   # precomputed top-y of each page at current scale
+        self.page_layouts    = []   # PageLayout per page, recomputed on reflow
         self.content_width   = 0    # drawing area width from last reflow
         self.content_height  = 0    # drawing area height from last reflow
         self.cache           = {}   # {page_index: cairo.ImageSurface} rendered at base_scale
@@ -102,7 +110,7 @@ class ArchivistWindow(Adw.ApplicationWindow):
 
         self.zoom = 1.0
         self.cache.clear()
-        self.page_y = []
+        self.page_layouts = []
         self.zoom_controls.set_visible(True)
         self.main_stack.set_visible_child_name("document")
         GLib.idle_add(self.deferred_layout)
@@ -135,24 +143,20 @@ class ArchivistWindow(Adw.ApplicationWindow):
                     return level
             return ZOOM_LEVELS[0]
 
-    def _content_anchor_v(self, viewport_y):
-        """Return (page_idx, frac_within_page) for the content point at viewport_y.
-
-        Uses page positions so the anchor is exact regardless of fixed PAGE_GAP offsets.
-        """
-        if not self.page_y:
+    def anchor_for_doc_y(self, doc_y):
+        """Return (page_idx, frac_within_page) for a Y coordinate in document space."""
+        if not self.page_layouts:
             return (0, 0.0)
-        doc_y = self.scrolled_window.get_vadjustment().get_value() + viewport_y
-        for i, py in enumerate(self.page_y):
-            sh = self.pages[i]["height"] * self.scale
-            if doc_y < py + sh:
-                return (i, max(0.0, (doc_y - py) / sh) if sh > 0 else 0.0)
-        return (len(self.page_y) - 1, 1.0)
+        for i, layout in enumerate(self.page_layouts):
+            if doc_y < layout.y + layout.height:
+                frac = 0.0 if layout.height <= 0 else (doc_y - layout.y) / layout.height
+                return (i, max(0.0, min(frac, 1.0)))
+        return (len(self.page_layouts) - 1, 1.0)
 
     def apply_zoom(self, new_zoom, anchor_vx=None, anchor_vy=None):
         """Zoom to new_zoom, keeping the point at (anchor_vx, anchor_vy) fixed.
 
-        Scroll is restored synchronously from the newly computed page_y so that
+        Scroll is restored synchronously from the newly computed page_layouts so that
         no intermediate frame is drawn at the wrong position (no flicker).
         """
         new_zoom = max(ZOOM_MIN, min(ZOOM_MAX, round(new_zoom, 4)))
@@ -168,20 +172,20 @@ class ArchivistWindow(Adw.ApplicationWindow):
             anchor_vy = vadj.get_page_size() / 2
 
         # Page-accurate vertical anchor — immune to fixed PAGE_GAP distortion
-        v_anchor = self._content_anchor_v(anchor_vy)
+        v_anchor = self.anchor_for_doc_y(vadj.get_value() + anchor_vy)
         # Proportional horizontal anchor (pages are horizontally centred, scaling is symmetric)
         old_upper_h = hadj.get_upper()
         frac_h = (hadj.get_value() + anchor_vx) / old_upper_h if old_upper_h > 0 else 0
 
         self.zoom  = new_zoom
         self.scale = self.base_scale * self.zoom
-        self.reflow()  # updates self.page_y, self.content_height, self.content_width
+        self.reflow()  # updates self.page_layouts, self.content_height, self.content_width
 
         # Compute correct scroll directly from the freshly-computed page positions
         page_idx, frac = v_anchor
-        page_idx = min(page_idx, len(self.page_y) - 1)
-        ph = self.pages[page_idx]["height"]
-        new_doc_y   = self.page_y[page_idx] + frac * ph * self.scale
+        page_idx = min(page_idx, len(self.page_layouts) - 1)
+        layout = self.page_layouts[page_idx]
+        new_doc_y   = layout.y + frac * layout.height
         new_scroll_v = max(0.0, min(new_doc_y - anchor_vy,
                                     self.content_height - vadj.get_page_size()))
         new_scroll_h = max(0.0, min(frac_h * self.content_width - anchor_vx,
@@ -214,27 +218,17 @@ class ArchivistWindow(Adw.ApplicationWindow):
         self.resize_tid = None
         w = int(self.scrolled_window.get_hadjustment().get_page_size())
         if w > 0 and w != self.last_width:
-            anchor = self.page_anchor()
+            anchor = self.anchor_for_doc_y(self.scrolled_window.get_vadjustment().get_value())
             self.update_layout(w)
             GLib.idle_add(self.restore_anchor, anchor)
         return GLib.SOURCE_REMOVE
 
-    def page_anchor(self):
-        """Return (page_idx, frac_within_page) for the page at the viewport top."""
-        if not self.page_y:
-            return (0, 0.0)
-        top = self.scrolled_window.get_vadjustment().get_value()
-        for i, py in enumerate(self.page_y):
-            sh = self.pages[i]["height"] * self.scale
-            if py + sh > top:
-                return (i, (top - py) / sh if sh > 0 else 0.0)
-        return (len(self.page_y) - 1, 0.0)
 
     def restore_anchor(self, anchor):
         page_idx, frac = anchor
-        page_idx = min(page_idx, len(self.page_y) - 1)
-        ph = self.pages[page_idx]["height"]
-        target = self.page_y[page_idx] + frac * ph * self.scale
+        page_idx = min(page_idx, len(self.page_layouts) - 1)
+        layout = self.page_layouts[page_idx]
+        target = layout.y + frac * layout.height
         vadj = self.scrolled_window.get_vadjustment()
         vadj.set_value(max(0.0, min(target, vadj.get_upper() - vadj.get_page_size())))
         return GLib.SOURCE_REMOVE
@@ -254,13 +248,17 @@ class ArchivistWindow(Adw.ApplicationWindow):
         max_pw = max(p["width"] for p in self.pages)
         vw     = self.last_width if self.last_width > 0 else self.scrolled_window.get_width()
 
-        self.page_y = []
-        y = PAGE_GAP
-        for p in self.pages:
-            self.page_y.append(y)
-            y += p["height"] * self.scale + PAGE_GAP
+        self.content_width = max(vw, int(max_pw * self.scale + 2 * PAGE_PAD))
 
-        self.content_width  = max(vw, int(max_pw * self.scale + 2 * PAGE_PAD))
+        self.page_layouts = []
+        y = PAGE_GAP
+        for meta in self.pages:
+            w = meta["width"] * self.scale
+            h = meta["height"] * self.scale
+            x = (self.content_width - w) / 2
+            self.page_layouts.append(PageLayout(x, y, w, h))
+            y += h + PAGE_GAP
+
         self.content_height = int(y)
         self.drawing_area.set_size_request(self.content_width, self.content_height)
         self.zoom_label.set_label(f"{round(self.zoom * 100)}%")
@@ -272,7 +270,7 @@ class ArchivistWindow(Adw.ApplicationWindow):
     def needed_pages(self):
         """Indices of pages that should be in the cache."""
         n = len(self.pages)
-        if not self.page_y:
+        if not self.page_layouts:
             return list(range(min(CACHE_AHEAD + CACHE_BEHIND, n)))
 
         vadj = self.scrolled_window.get_vadjustment()
@@ -280,12 +278,12 @@ class ArchivistWindow(Adw.ApplicationWindow):
         bot  = top + vadj.get_page_size()
 
         first_vis = last_vis = None
-        for i, py in enumerate(self.page_y):
-            if py + self.pages[i]["height"] * self.scale >= top and py <= bot:
+        for i, layout in enumerate(self.page_layouts):
+            if layout.y + layout.height >= top and layout.y <= bot:
                 if first_vis is None:
                     first_vis = i
                 last_vis = i
-            elif py > bot:
+            elif layout.y > bot:
                 break
 
         if first_vis is None:
@@ -343,7 +341,7 @@ class ArchivistWindow(Adw.ApplicationWindow):
 
     # ── drawing ───────────────────────────────────────────────────────────────
 
-    def draw(self, area, cr, width, height):
+    def draw(self, area, cr, _width, _height):
         if not self.document:
             return
 
@@ -352,28 +350,21 @@ class ArchivistWindow(Adw.ApplicationWindow):
 
         clip = cr.clip_extents()
 
-        y = PAGE_GAP
-        for i, p in enumerate(self.pages):
-            sw, sh = p["width"] * self.scale, p["height"] * self.scale
-            x      = (width - sw) / 2
-
-            if y + sh < clip[1]:
-                y += sh + PAGE_GAP
+        for i, layout in enumerate(self.page_layouts):
+            if layout.y + layout.height < clip[1]:
                 continue
-            if y > clip[3]:
+            if layout.y > clip[3]:
                 break
 
             surface = self.cache.get(i)
             if surface is not None:
                 cr.save()
-                cr.translate(x, y)
+                cr.translate(layout.x, layout.y)
                 cr.scale(self.zoom, self.zoom)
                 cr.set_source_surface(surface, 0, 0)
                 cr.paint()
                 cr.restore()
             else:
                 cr.set_source_rgb(1, 1, 1)
-                cr.rectangle(x, y, sw, sh)
+                cr.rectangle(layout.x, layout.y, layout.width, layout.height)
                 cr.fill()
-
-            y += sh + PAGE_GAP
