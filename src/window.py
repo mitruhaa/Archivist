@@ -33,6 +33,7 @@ class ArchivistWindow(Adw.ApplicationWindow):
         super().__init__(**kwargs)
 
         self.document        = None
+        self.pages           = []   # [{page, width, height}, …] loaded once on open
         self.zoom            = 1.0
         self.base_scale      = 1.0
         self.scale           = 1.0
@@ -93,6 +94,12 @@ class ArchivistWindow(Adw.ApplicationWindow):
         except GLib.Error:
             return
 
+        self.pages = []
+        for i in range(self.document.get_n_pages()):
+            page = self.document.get_page(i)
+            w, h = page.get_size()
+            self.pages.append({"page": page, "width": w, "height": h})
+
         self.zoom = 1.0
         self.cache.clear()
         self.page_y = []
@@ -137,8 +144,7 @@ class ArchivistWindow(Adw.ApplicationWindow):
             return (0, 0.0)
         doc_y = self.scrolled_window.get_vadjustment().get_value() + viewport_y
         for i, py in enumerate(self.page_y):
-            _, ph = self.document.get_page(i).get_size()
-            sh = ph * self.scale
+            sh = self.pages[i]["height"] * self.scale
             if doc_y < py + sh:
                 return (i, max(0.0, (doc_y - py) / sh) if sh > 0 else 0.0)
         return (len(self.page_y) - 1, 1.0)
@@ -174,7 +180,7 @@ class ArchivistWindow(Adw.ApplicationWindow):
         # Compute correct scroll directly from the freshly-computed page positions
         page_idx, frac = v_anchor
         page_idx = min(page_idx, len(self.page_y) - 1)
-        _, ph = self.document.get_page(page_idx).get_size()
+        ph = self.pages[page_idx]["height"]
         new_doc_y   = self.page_y[page_idx] + frac * ph * self.scale
         new_scroll_v = max(0.0, min(new_doc_y - anchor_vy,
                                     self.content_height - vadj.get_page_size()))
@@ -219,8 +225,7 @@ class ArchivistWindow(Adw.ApplicationWindow):
             return (0, 0.0)
         top = self.scrolled_window.get_vadjustment().get_value()
         for i, py in enumerate(self.page_y):
-            _, ph = self.document.get_page(i).get_size()
-            sh = ph * self.scale
+            sh = self.pages[i]["height"] * self.scale
             if py + sh > top:
                 return (i, (top - py) / sh if sh > 0 else 0.0)
         return (len(self.page_y) - 1, 0.0)
@@ -228,7 +233,7 @@ class ArchivistWindow(Adw.ApplicationWindow):
     def restore_anchor(self, anchor):
         page_idx, frac = anchor
         page_idx = min(page_idx, len(self.page_y) - 1)
-        _, ph = self.document.get_page(page_idx).get_size()
+        ph = self.pages[page_idx]["height"]
         target = self.page_y[page_idx] + frac * ph * self.scale
         vadj = self.scrolled_window.get_vadjustment()
         vadj.set_value(max(0.0, min(target, vadj.get_upper() - vadj.get_page_size())))
@@ -238,10 +243,7 @@ class ArchivistWindow(Adw.ApplicationWindow):
         if not self.document or viewport_width <= 0:
             return
         self.last_width = viewport_width
-        max_pw = max(
-            self.document.get_page(i).get_size()[0]
-            for i in range(self.document.get_n_pages())
-        )
+        max_pw = max(p["width"] for p in self.pages)
         self.base_scale = (viewport_width - 2 * PAGE_PAD) / max_pw
         self.scale       = self.base_scale * self.zoom
         self.reflow()
@@ -249,16 +251,14 @@ class ArchivistWindow(Adw.ApplicationWindow):
     def reflow(self):
         if not self.document:
             return
-        n      = self.document.get_n_pages()
-        max_pw = max(self.document.get_page(i).get_size()[0] for i in range(n))
+        max_pw = max(p["width"] for p in self.pages)
         vw     = self.last_width if self.last_width > 0 else self.scrolled_window.get_width()
 
         self.page_y = []
         y = PAGE_GAP
-        for i in range(n):
+        for p in self.pages:
             self.page_y.append(y)
-            _, ph = self.document.get_page(i).get_size()
-            y += ph * self.scale + PAGE_GAP
+            y += p["height"] * self.scale + PAGE_GAP
 
         self.content_width  = max(vw, int(max_pw * self.scale + 2 * PAGE_PAD))
         self.content_height = int(y)
@@ -271,7 +271,7 @@ class ArchivistWindow(Adw.ApplicationWindow):
 
     def needed_pages(self):
         """Indices of pages that should be in the cache."""
-        n = self.document.get_n_pages()
+        n = len(self.pages)
         if not self.page_y:
             return list(range(min(CACHE_AHEAD + CACHE_BEHIND, n)))
 
@@ -281,8 +281,7 @@ class ArchivistWindow(Adw.ApplicationWindow):
 
         first_vis = last_vis = None
         for i, py in enumerate(self.page_y):
-            _, ph = self.document.get_page(i).get_size()
-            if py + ph * self.scale >= top and py <= bot:
+            if py + self.pages[i]["height"] * self.scale >= top and py <= bot:
                 if first_vis is None:
                     first_vis = i
                 last_vis = i
@@ -328,13 +327,12 @@ class ArchivistWindow(Adw.ApplicationWindow):
         return GLib.SOURCE_REMOVE
 
     def render_page(self, i):
-        page   = self.document.get_page(i)
-        pw, ph = page.get_size()
-        sw, sh = max(1, int(pw * self.base_scale)), max(1, int(ph * self.base_scale))
+        p      = self.pages[i]
+        sw, sh = max(1, int(p["width"] * self.base_scale)), max(1, int(p["height"] * self.base_scale))
         surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, sw, sh)
         ctx     = cairo.Context(surface)
         ctx.scale(self.base_scale, self.base_scale)
-        page.render(ctx)
+        p["page"].render(ctx)
         self.cache[i] = surface
         self.cache_scale = self.base_scale
 
@@ -355,10 +353,8 @@ class ArchivistWindow(Adw.ApplicationWindow):
         clip = cr.clip_extents()
 
         y = PAGE_GAP
-        for i in range(self.document.get_n_pages()):
-            page   = self.document.get_page(i)
-            pw, ph = page.get_size()
-            sw, sh = pw * self.scale, ph * self.scale
+        for i, p in enumerate(self.pages):
+            sw, sh = p["width"] * self.scale, p["height"] * self.scale
             x      = (width - sw) / 2
 
             if y + sh < clip[1]:
