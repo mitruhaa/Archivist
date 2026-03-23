@@ -6,12 +6,14 @@ from gi.repository import Adw, Gdk, Gio, Gtk, Poppler, GLib
 
 PAGE_GAP     = 20
 PAGE_PAD     = 20
-ZOOM_STEP    = 0.10
-ZOOM_SCROLL  = 0.05
+ZOOM_SCROLL  = 0.10   # zoom multiplier per scroll tick (≈ Evince's 10%)
 ZOOM_MIN     = 0.10
 ZOOM_MAX     = 5.00
-CACHE_BEHIND = 3    # pages to keep rendered behind viewport
-CACHE_AHEAD  = 7    # pages to pre-render ahead of viewport
+CACHE_BEHIND = 2    # pages to keep rendered behind viewport
+CACHE_AHEAD  = 2    # pages to pre-render ahead of viewport
+
+# Discrete zoom levels used by the +/- buttons, mirroring Evince's preset list
+ZOOM_LEVELS  = [0.25, 0.33, 0.50, 0.67, 0.75, 1.00, 1.25, 1.50, 2.00, 4.00]
 
 @Gtk.Template(resource_path='/io/github/mitruhaa/Archivist/gtk/window.ui')
 class ArchivistWindow(Adw.ApplicationWindow):
@@ -30,21 +32,23 @@ class ArchivistWindow(Adw.ApplicationWindow):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
-        self.document     = None
-        self.zoom         = 1.0
-        self.base_scale  = 1.0
-        self.scale        = 1.0
-        self.last_width  = -1
-        self.resize_tid  = None
-        self.render_tid  = None
-        self.page_y      = []   # precomputed top-y of each page at current scale
-        self.cache       = {}   # {page_index: cairo.ImageSurface} rendered at base_scale
-        self.cache_scale = 1.0  # base_scale at which cache entries were rendered
+        self.document        = None
+        self.zoom            = 1.0
+        self.base_scale      = 1.0
+        self.scale           = 1.0
+        self.last_width      = -1
+        self.resize_tid      = None
+        self.render_tid      = None
+        self.page_y          = []   # precomputed top-y of each page at current scale
+        self.content_width   = 0    # drawing area width from last reflow
+        self.content_height  = 0    # drawing area height from last reflow
+        self.cache           = {}   # {page_index: cairo.ImageSurface} rendered at base_scale
+        self.cache_scale     = 1.0  # base_scale at which cache entries were rendered
 
         self.open_file_button.connect('clicked', self.open_dialog)
         self.open_welcome_button.connect('clicked', self.open_dialog)
-        self.zoom_in_button.connect('clicked',  lambda *_: self.apply_zoom(self.zoom + ZOOM_STEP))
-        self.zoom_out_button.connect('clicked', lambda *_: self.apply_zoom(self.zoom - ZOOM_STEP))
+        self.zoom_in_button.connect('clicked',  lambda *_: self.apply_zoom(self._next_zoom_level(+1)))
+        self.zoom_out_button.connect('clicked', lambda *_: self.apply_zoom(self._next_zoom_level(-1)))
 
         self.drawing_area.set_draw_func(self.draw)
 
@@ -58,6 +62,12 @@ class ArchivistWindow(Adw.ApplicationWindow):
         scroll_ctrl.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
         scroll_ctrl.connect('scroll', self.on_scroll)
         self.scrolled_window.add_controller(scroll_ctrl)
+
+        self._cursor_x = 0.0
+        self._cursor_y = 0.0
+        motion_ctrl = Gtk.EventControllerMotion.new()
+        motion_ctrl.connect('motion', lambda _c, x, y: self._track_cursor(x, y))
+        self.scrolled_window.add_controller(motion_ctrl)
 
     # ── file dialog ───────────────────────────────────────────────────────────
 
@@ -101,30 +111,87 @@ class ArchivistWindow(Adw.ApplicationWindow):
 
     # ── zoom ──────────────────────────────────────────────────────────────────
 
-    def apply_zoom(self, new_zoom):
+    def _track_cursor(self, x, y):
+        self._cursor_x = x
+        self._cursor_y = y
+
+    def _next_zoom_level(self, direction):
+        """Return the next preset zoom level above (+1) or below (-1) the current zoom."""
+        if direction > 0:
+            for level in ZOOM_LEVELS:
+                if level > self.zoom + 0.01:
+                    return level
+            return ZOOM_LEVELS[-1]
+        else:
+            for level in reversed(ZOOM_LEVELS):
+                if level < self.zoom - 0.01:
+                    return level
+            return ZOOM_LEVELS[0]
+
+    def _content_anchor_v(self, viewport_y):
+        """Return (page_idx, frac_within_page) for the content point at viewport_y.
+
+        Uses page positions so the anchor is exact regardless of fixed PAGE_GAP offsets.
+        """
+        if not self.page_y:
+            return (0, 0.0)
+        doc_y = self.scrolled_window.get_vadjustment().get_value() + viewport_y
+        for i, py in enumerate(self.page_y):
+            _, ph = self.document.get_page(i).get_size()
+            sh = ph * self.scale
+            if doc_y < py + sh:
+                return (i, max(0.0, (doc_y - py) / sh) if sh > 0 else 0.0)
+        return (len(self.page_y) - 1, 1.0)
+
+    def apply_zoom(self, new_zoom, anchor_vx=None, anchor_vy=None):
+        """Zoom to new_zoom, keeping the point at (anchor_vx, anchor_vy) fixed.
+
+        Scroll is restored synchronously from the newly computed page_y so that
+        no intermediate frame is drawn at the wrong position (no flicker).
+        """
         new_zoom = max(ZOOM_MIN, min(ZOOM_MAX, round(new_zoom, 4)))
         if abs(new_zoom - self.zoom) < 0.001:
             return
 
-        vadj  = self.scrolled_window.get_vadjustment()
-        upper = vadj.get_upper()
-        frac  = (vadj.get_value() + vadj.get_page_size() / 2) / upper if upper > 0 else 0
+        vadj = self.scrolled_window.get_vadjustment()
+        hadj = self.scrolled_window.get_hadjustment()
+
+        if anchor_vx is None:
+            anchor_vx = hadj.get_page_size() / 2
+        if anchor_vy is None:
+            anchor_vy = vadj.get_page_size() / 2
+
+        # Page-accurate vertical anchor — immune to fixed PAGE_GAP distortion
+        v_anchor = self._content_anchor_v(anchor_vy)
+        # Proportional horizontal anchor (pages are horizontally centred, scaling is symmetric)
+        old_upper_h = hadj.get_upper()
+        frac_h = (hadj.get_value() + anchor_vx) / old_upper_h if old_upper_h > 0 else 0
 
         self.zoom  = new_zoom
         self.scale = self.base_scale * self.zoom
-        self.reflow()
-        GLib.idle_add(self.restore_scroll, frac)
+        self.reflow()  # updates self.page_y, self.content_height, self.content_width
 
-    def restore_scroll(self, frac):
-        vadj   = self.scrolled_window.get_vadjustment()
-        upper  = vadj.get_upper()
-        target = frac * upper - vadj.get_page_size() / 2
-        vadj.set_value(max(0.0, min(target, upper - vadj.get_page_size())))
-        return GLib.SOURCE_REMOVE
+        # Compute correct scroll directly from the freshly-computed page positions
+        page_idx, frac = v_anchor
+        page_idx = min(page_idx, len(self.page_y) - 1)
+        _, ph = self.document.get_page(page_idx).get_size()
+        new_doc_y   = self.page_y[page_idx] + frac * ph * self.scale
+        new_scroll_v = max(0.0, min(new_doc_y - anchor_vy,
+                                    self.content_height - vadj.get_page_size()))
+        new_scroll_h = max(0.0, min(frac_h * self.content_width - anchor_vx,
+                                    self.content_width - hadj.get_page_size()))
+
+        # Use configure() to update upper and value atomically so GTK cannot clamp
+        # new_scroll_v against the stale upper bound before the allocation is processed.
+        vadj.configure(new_scroll_v, vadj.get_lower(), self.content_height,
+                       vadj.get_step_increment(), vadj.get_page_increment(), vadj.get_page_size())
+        hadj.configure(new_scroll_h, hadj.get_lower(), self.content_width,
+                       hadj.get_step_increment(), hadj.get_page_increment(), hadj.get_page_size())
 
     def on_scroll(self, ctrl, dx, dy):
         if ctrl.get_current_event_state() & Gdk.ModifierType.CONTROL_MASK:
-            self.apply_zoom(self.zoom * (1.0 - dy * ZOOM_SCROLL))
+            self.apply_zoom(self.zoom * (1.0 - dy * ZOOM_SCROLL),
+                            anchor_vx=self._cursor_x, anchor_vy=self._cursor_y)
             return True
         return False
 
@@ -193,8 +260,9 @@ class ArchivistWindow(Adw.ApplicationWindow):
             _, ph = self.document.get_page(i).get_size()
             y += ph * self.scale + PAGE_GAP
 
-        content_w = max(vw, int(max_pw * self.scale + 2 * PAGE_PAD))
-        self.drawing_area.set_size_request(content_w, int(y))
+        self.content_width  = max(vw, int(max_pw * self.scale + 2 * PAGE_PAD))
+        self.content_height = int(y)
+        self.drawing_area.set_size_request(self.content_width, self.content_height)
         self.zoom_label.set_label(f"{round(self.zoom * 100)}%")
         self.schedule_render()
         self.drawing_area.queue_draw()
