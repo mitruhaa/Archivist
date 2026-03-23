@@ -51,8 +51,7 @@ class ArchivistWindow(Adw.ApplicationWindow):
         self.page_layouts    = []   # PageLayout per page, recomputed on reflow
         self.content_width   = 0    # drawing area width from last reflow
         self.content_height  = 0    # drawing area height from last reflow
-        self.cache           = {}   # {page_index: cairo.ImageSurface} rendered at base_scale
-        self.cache_scale     = 1.0  # base_scale at which cache entries were rendered
+        self.cache           = {}   # {page_index: (cairo.ImageSurface, scale)}
 
         self.open_file_button.connect('clicked', self.open_dialog)
         self.open_welcome_button.connect('clicked', self.open_dialog)
@@ -305,14 +304,11 @@ class ArchivistWindow(Adw.ApplicationWindow):
         if not self.document:
             return GLib.SOURCE_REMOVE
 
-        if abs(self.base_scale - self.cache_scale) > 0.001:
-            self.cache.clear()
-            self.cache_scale = self.base_scale
-
         needed = self.needed_pages()
         self.evict(set(needed))
 
-        to_render = [i for i in needed if i not in self.cache]
+        to_render = [i for i in needed
+                     if i not in self.cache or abs(self.cache[i][1] - self.base_scale) > 0.001]
         if not to_render:
             return GLib.SOURCE_REMOVE
 
@@ -332,8 +328,7 @@ class ArchivistWindow(Adw.ApplicationWindow):
         ctx     = cairo.Context(surface)
         ctx.scale(self.base_scale, self.base_scale)
         p["page"].render(ctx)
-        self.cache[i] = surface
-        self.cache_scale = self.base_scale
+        self.cache[i] = (surface, self.base_scale)
 
     def evict(self, keep):
         for k in list(self.cache):
@@ -357,11 +352,12 @@ class ArchivistWindow(Adw.ApplicationWindow):
             if layout.y > clip[3]:
                 break
 
-            surface = self.cache.get(i)
-            if surface is not None:
+            entry = self.cache.get(i)
+            if entry is not None:
+                surface, surf_scale = entry
                 cr.save()
                 cr.translate(layout.x, layout.y)
-                cr.scale(self.zoom, self.zoom)
+                cr.scale(self.scale / surf_scale, self.scale / surf_scale)
                 cr.set_source_surface(surface, 0, 0)
                 cr.paint()
                 cr.restore()
