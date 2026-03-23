@@ -44,7 +44,6 @@ class ArchivistWindow(Adw.ApplicationWindow):
         self.pages           = []   # [{page, width, height}, …] loaded once on open
         self.zoom            = 1.0
         self.base_scale      = 1.0
-        self.scale           = 1.0
         self.last_width      = -1
         self.resize_tid      = None
         self.render_tid      = None
@@ -126,6 +125,10 @@ class ArchivistWindow(Adw.ApplicationWindow):
 
     # ── zoom ──────────────────────────────────────────────────────────────────
 
+    @property
+    def scale(self):
+        return self.base_scale * self.zoom
+
     def _track_cursor(self, x, y):
         self._cursor_x = x
         self._cursor_y = y
@@ -178,7 +181,6 @@ class ArchivistWindow(Adw.ApplicationWindow):
         frac_h = (hadj.get_value() + anchor_vx) / old_upper_h if old_upper_h > 0 else 0
 
         self.zoom  = new_zoom
-        self.scale = self.base_scale * self.zoom
         self.reflow()  # updates self.page_layouts, self.content_height, self.content_width
 
         # Compute correct scroll directly from the freshly-computed page positions
@@ -239,7 +241,6 @@ class ArchivistWindow(Adw.ApplicationWindow):
         self.last_width = viewport_width
         max_pw = max(p["width"] for p in self.pages)
         self.base_scale = (viewport_width - 2 * PAGE_PAD) / max_pw
-        self.scale       = self.base_scale * self.zoom
         self.reflow()
 
     def reflow(self):
