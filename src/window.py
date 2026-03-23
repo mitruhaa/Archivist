@@ -12,6 +12,7 @@ ZOOM_MIN     = 0.10
 ZOOM_MAX     = 5.00
 CACHE_BEHIND = 2    # pages to keep rendered behind viewport
 CACHE_AHEAD  = 2    # pages to pre-render ahead of viewport
+RESIZE_TIMEOUT = 50
 
 # Discrete zoom levels used by the +/- buttons, mirroring Evince's preset list
 ZOOM_LEVELS  = [0.25, 0.33, 0.50, 0.67, 0.75, 1.00, 1.25, 1.50, 2.00, 4.00]
@@ -214,25 +215,21 @@ class ArchivistWindow(Adw.ApplicationWindow):
             return
         if self.resize_tid is not None:
             GLib.source_remove(self.resize_tid)
-        self.resize_tid = GLib.timeout_add(20, self.do_resize)
+        self.resize_tid = GLib.timeout_add(RESIZE_TIMEOUT, self.do_resize)
 
     def do_resize(self):
         self.resize_tid = None
         w = int(self.scrolled_window.get_hadjustment().get_page_size())
         if w > 0 and w != self.last_width:
-            anchor = self.anchor_for_doc_y(self.scrolled_window.get_vadjustment().get_value())
+            vadj = self.scrolled_window.get_vadjustment()
+            anchor = self.anchor_for_doc_y(vadj.get_value())
             self.update_layout(w)
-            GLib.idle_add(self.restore_anchor, anchor)
-        return GLib.SOURCE_REMOVE
-
-
-    def restore_anchor(self, anchor):
-        page_idx, frac = anchor
-        page_idx = min(page_idx, len(self.page_layouts) - 1)
-        layout = self.page_layouts[page_idx]
-        target = layout.y + frac * layout.height
-        vadj = self.scrolled_window.get_vadjustment()
-        vadj.set_value(max(0.0, min(target, vadj.get_upper() - vadj.get_page_size())))
+            page_idx, frac = anchor
+            page_idx = min(page_idx, len(self.page_layouts) - 1)
+            layout = self.page_layouts[page_idx]
+            target = layout.y + frac * layout.height
+            vadj.configure(target, vadj.get_lower(), self.content_height,
+                           vadj.get_step_increment(), vadj.get_page_increment(), vadj.get_page_size())
         return GLib.SOURCE_REMOVE
 
     def update_layout(self, viewport_width):
@@ -240,7 +237,8 @@ class ArchivistWindow(Adw.ApplicationWindow):
             return
         self.last_width = viewport_width
         max_pw = max(p["width"] for p in self.pages)
-        self.base_scale = (viewport_width - 2 * PAGE_PAD) / max_pw
+        usable_width = max(1, viewport_width - 2 * PAGE_PAD)
+        self.base_scale = usable_width / max_pw
         self.reflow()
 
     def reflow(self):
