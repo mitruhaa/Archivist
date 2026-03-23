@@ -222,12 +222,14 @@ class ArchivistWindow(Adw.ApplicationWindow):
         w = int(self.scrolled_window.get_hadjustment().get_page_size())
         if w > 0 and w != self.last_width:
             vadj = self.scrolled_window.get_vadjustment()
-            anchor = self.anchor_for_doc_y(vadj.get_value())
+            mid = vadj.get_value() + vadj.get_page_size() / 2
+            anchor = self.anchor_for_doc_y(mid)
             self.update_layout(w)
             page_idx, frac = anchor
             page_idx = min(page_idx, len(self.page_layouts) - 1)
             layout = self.page_layouts[page_idx]
-            target = layout.y + frac * layout.height
+            new_mid = layout.y + frac * layout.height
+            target = new_mid - vadj.get_page_size() / 2
             vadj.configure(target, vadj.get_lower(), self.content_height,
                            vadj.get_step_increment(), vadj.get_page_increment(), vadj.get_page_size())
         return GLib.SOURCE_REMOVE
