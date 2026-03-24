@@ -53,6 +53,19 @@ class ArchivistWindow(Adw.ApplicationWindow):
         self.content_height  = 0    # drawing area height from last reflow
         self.cache           = {}   # {page_index: (cairo.ImageSurface, scale)}
 
+        self.sel_start       = None 
+        self.sel_end         = None 
+        self._over_page      = False
+
+        self.sel_glyph_color = Poppler.Color()
+        self.sel_glyph_color.red   = 0xffff
+        self.sel_glyph_color.green = 0xffff
+        self.sel_glyph_color.blue  = 0xffff
+        self.sel_bg_color = Poppler.Color()
+        self.sel_bg_color.red   = 0x3535
+        self.sel_bg_color.green = 0x8484
+        self.sel_bg_color.blue  = 0xe4e4
+
         self.open_file_button.connect('clicked', self.open_dialog)
         self.open_welcome_button.connect('clicked', self.open_dialog)
         self.zoom_in_button.connect('clicked',  lambda *_: self.apply_zoom(self._next_zoom_level(+1)))
@@ -76,6 +89,17 @@ class ArchivistWindow(Adw.ApplicationWindow):
         motion_ctrl = Gtk.EventControllerMotion.new()
         motion_ctrl.connect('motion', lambda _c, x, y: self._track_cursor(x, y))
         self.scrolled_window.add_controller(motion_ctrl)
+
+        drag = Gtk.GestureDrag.new()
+        drag.set_button(1)
+        drag.connect('drag-begin',  self.on_drag_begin)
+        drag.connect('drag-update', self.on_drag_update)
+        drag.connect('drag-end',    self.on_drag_end)
+        self.drawing_area.add_controller(drag)
+
+        draw_motion = Gtk.EventControllerMotion.new()
+        draw_motion.connect('motion', self.on_draw_area_motion)
+        self.drawing_area.add_controller(draw_motion)
 
     # ── file dialog ───────────────────────────────────────────────────────────
 
@@ -110,6 +134,8 @@ class ArchivistWindow(Adw.ApplicationWindow):
         self.zoom = 1.0
         self.cache.clear()
         self.page_layouts = []
+        self.sel_start = None
+        self.sel_end = None
         self.zoom_controls.set_visible(True)
         self.main_stack.set_visible_child_name("document")
         GLib.idle_add(self.deferred_layout)
@@ -335,6 +361,97 @@ class ArchivistWindow(Adw.ApplicationWindow):
             if k not in keep:
                 del self.cache[k]
 
+    # ── text selection ────────────────────────────────────────────────────────
+
+    def on_drag_begin(self, gesture, x, y):
+        if not self.document:
+            return
+        # x, y are in drawing-area (canvas) coordinates
+        self.sel_start = (x, y)
+        self.sel_end   = (x, y)
+        self.drawing_area.queue_draw()
+
+    def on_drag_update(self, gesture, dx, dy):
+        if self.sel_start is None:
+            return
+        sx, sy = self.sel_start
+        self.sel_end = (sx + dx, sy + dy)
+        self.drawing_area.queue_draw()
+
+    def on_drag_end(self, gesture, dx, dy):
+        if self.sel_start is None:
+            return
+        sx, sy = self.sel_start
+        self.sel_end = (sx + dx, sy + dy)
+        self.copy_selection_to_clipboard()
+        self.drawing_area.queue_draw()
+
+    def on_draw_area_motion(self, ctrl, canvas_x, canvas_y):
+        """Switch to a text cursor when hovering over a page."""
+        if not self.page_layouts:
+            return
+        over = any(
+            layout.x <= canvas_x <= layout.x + layout.width and
+            layout.y <= canvas_y <= layout.y + layout.height
+            for layout in self.page_layouts
+        )
+        if over != self._over_page:
+            self._over_page = over
+            self.drawing_area.set_cursor_from_name("text" if over else "default")
+
+    def selection_rect_for_page(self, i):
+        """Return a Poppler.Rectangle in PDF-point coords for the selection on page i.
+
+        Returns None when the current selection does not overlap that page or is
+        effectively empty (click without drag).
+        """
+        if self.sel_start is None or self.sel_end is None:
+            return None
+        layout = self.page_layouts[i]
+        meta   = self.pages[i]
+
+        # Selection bounding box in canvas (drawing-area) coordinates
+        cx1 = min(self.sel_start[0], self.sel_end[0])
+        cy1 = min(self.sel_start[1], self.sel_end[1])
+        cx2 = max(self.sel_start[0], self.sel_end[0])
+        cy2 = max(self.sel_start[1], self.sel_end[1])
+
+        # Reject if selection does not overlap this page's canvas rect
+        if cx2 < layout.x or cx1 > layout.x + layout.width:
+            return None
+        if cy2 < layout.y or cy1 > layout.y + layout.height:
+            return None
+
+        # Convert canvas coords → PDF-point coords, clamped to page size
+        pw, ph = meta["width"], meta["height"]
+        px1 = max(0.0, min(pw, (cx1 - layout.x) / self.scale))
+        py1 = max(0.0, min(ph, (cy1 - layout.y) / self.scale))
+        px2 = max(0.0, min(pw, (cx2 - layout.x) / self.scale))
+        py2 = max(0.0, min(ph, (cy2 - layout.y) / self.scale))
+
+        if px2 <= px1 or py2 <= py1:
+            return None  # zero-area (click without drag)
+
+        rect = Poppler.Rectangle()
+        rect.x1, rect.y1 = px1, py1
+        rect.x2, rect.y2 = px2, py2
+        return rect
+
+    def copy_selection_to_clipboard(self):
+        parts = []
+        for i in range(len(self.page_layouts)):
+            sel_rect = self.selection_rect_for_page(i)
+            if sel_rect is None:
+                continue
+            text = self.pages[i]["page"].get_selected_text(
+                Poppler.SelectionStyle.GLYPH, sel_rect
+            )
+            if text:
+                parts.append(text)
+        text = '\n'.join(parts)
+        if text:
+            self.get_clipboard().set(text)
+
     # ── drawing ───────────────────────────────────────────────────────────────
 
     def draw(self, area, cr, _width, _height):
@@ -365,3 +482,15 @@ class ArchivistWindow(Adw.ApplicationWindow):
                 cr.set_source_rgb(1, 1, 1)
                 cr.rectangle(layout.x, layout.y, layout.width, layout.height)
                 cr.fill()
+
+            sel_rect = self.selection_rect_for_page(i)
+            if sel_rect is not None:
+                cr.save()
+                cr.translate(layout.x, layout.y)
+                cr.scale(self.scale, self.scale)
+                self.pages[i]["page"].render_selection(
+                    cr, sel_rect, sel_rect,
+                    Poppler.SelectionStyle.GLYPH,
+                    self.sel_glyph_color, self.sel_bg_color,
+                )
+                cr.restore()
